@@ -13,6 +13,7 @@ import argparse
 import datetime
 import io
 import json
+import math
 import os
 import queue
 import socket
@@ -86,12 +87,12 @@ PANEL_WARM = (16, 29, 42)
 # Gradient endpoints (top -> bottom)
 GRAD_SILVER = ((247, 250, 252), (174, 185, 196))   # charging, only neutral area
 GRAD_WB = ((255, 193, 35), (255, 98, 22))          # WorkBuddy, one card / two rows
-GRAD_CODEX = ((181, 128, 91), (91, 55, 38))        # Codex, caramel -> mocha
+GRAD_CODEX = ((146, 32, 40), (58, 12, 18))         # Codex, dark crimson -> deep wine
 GRAD_DS = ((53, 224, 255), (10, 107, 240))         # DeepSeek, cyan -> blue
 GRAD_FOOT = ((41, 68, 87), (24, 46, 64))
 BORDER_SILVER = (255, 255, 255)
 BORDER_WB = (255, 233, 194)
-BORDER_CODEX = (232, 197, 170)
+BORDER_CODEX = (255, 168, 162)
 BORDER_DS = (207, 246, 255)
 BORDER_FOOT = (62, 86, 107)
 HAIRLINE = (135, 148, 160)
@@ -366,6 +367,23 @@ def reset_text(window):
         return '重置时间未知'
 
 
+def reset_short(window):
+    """一行放得下的重置提示（长卡只有 155px 宽）。"""
+    stamp = window.get('resets_at')
+    if not stamp:
+        return '重置时间未提供'
+    try:
+        when = datetime.datetime.fromtimestamp(float(stamp)).astimezone()
+        left = (when - datetime.datetime.now().astimezone()).total_seconds()
+        if left < 0:
+            return '即将重置'
+        hours, minutes = divmod(int(left) // 60, 60)
+        left_text = f"{hours}小时{minutes}分" if hours else f"{minutes}分"
+        return f"剩 {left_text} · {when.strftime('%H:%M')} 重置"
+    except Exception:
+        return '重置时间未知'
+
+
 def text_width(draw, text, fnt):
     box = draw.textbbox((0, 0), text, font=fnt)
     return box[2] - box[0]
@@ -410,11 +428,77 @@ def split_shaded_box(im, draw, box, grad_top, grad_bottom, split_y, borders):
     draw.line((x0 + 4, y1 - 1, x1 - 4, y1 - 1), fill=borders[1], width=1)
 
 
+_PATH_CACHE = {}
+
+
+def border_points(box, radius=6):
+    """把圆角矩形边框离散成像素点，顺时针排列，按坐标缓存。"""
+    key = (box, radius)
+    cached = _PATH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    x0, y0, x1, y1 = box
+    r = radius
+    pts = []
+
+    def seg(ax, ay, bx, by):
+        steps = max(1, int(max(abs(bx - ax), abs(by - ay))))
+        for i in range(steps):
+            t = i / steps
+            pts.append((round(ax + (bx - ax) * t), round(ay + (by - ay) * t)))
+
+    def arc(cx, cy, a0, a1):
+        steps = max(2, int(abs(a1 - a0) * r))
+        for i in range(steps):
+            a = a0 + (a1 - a0) * i / steps
+            pts.append((round(cx + r * math.cos(a)), round(cy + r * math.sin(a))))
+
+    seg(x0 + r, y0, x1 - r, y0)
+    arc(x1 - r, y0 + r, -math.pi / 2, 0)
+    seg(x1, y0 + r, x1, y1 - r)
+    arc(x1 - r, y1 - r, 0, math.pi / 2)
+    seg(x1 - r, y1, x0 + r, y1)
+    arc(x0 + r, y1 - r, math.pi / 2, math.pi)
+    seg(x0, y1 - r, x0, y0 + r)
+    arc(x0 + r, y0 + r, math.pi, math.pi * 1.5)
+    _PATH_CACHE[key] = pts
+    return pts
+
+
+# 账户模式的四个板块，按阅读顺序排；相位按序号等分，正好一拍一个。
+RELAY_BOXES = (
+    (8, 42, 311, 85),       # 充电：顶部
+    (8, 91, 162, 219),      # Codex：左侧大块
+    (168, 91, 311, 170),    # WorkBuddy：右上
+    (168, 176, 311, 219),   # DeepSeek：右下
+)
+
+
+def synchronized_marquees(draw, boxes, phase, radius=6,
+                          head=(255, 255, 255), tail=(178, 190, 204)):
+    """四块同时跑，相位严格等分，逐像素 smoothstep 渐变。
+
+    光带画在卡片外圈 1px：外面是黑底，纯白才亮得起来；画在边框上会像掉漆。
+    每块相差 1/4 圈，所以每一拍正好轮到下一块经过起点，首尾自然接上。
+    """
+    for beat, (x0, y0, x1, y1) in enumerate(boxes):
+        path = border_points((x0 - 1, y0 - 1, x1 + 1, y1 + 1), radius + 1)
+        total = len(path)
+        runner_head = int(((phase + beat / len(boxes)) % 1.0) * total)
+        span = max(32, int(total * 0.20))
+        for offset in range(span):
+            point = (runner_head - span + 1 + offset) % total
+            progress = offset / max(1, span - 1)
+            fade = progress * progress * (3.0 - 2.0 * progress)
+            color = tuple(round(lo + (hi - lo) * fade) for lo, hi in zip(tail, head))
+            draw.line([path[point], path[(point + 1) % total]], fill=color, width=2)
+
+
 def right_align(draw, x1, y, text, fnt, color):
     draw.text((x1 - text_width(draw, text, fnt), y), text, font=fnt, fill=color)
 
 
-def render(data, pulse=False):
+def render(data, pulse=False, phase=0.0):
     im = Image.new('RGB', (W, H), BG)
     draw = ImageDraw.Draw(im)
     stamp = datetime.datetime.fromisoformat(data['checked_at']).strftime('%H:%M')
@@ -448,39 +532,44 @@ def render(data, pulse=False):
         draw.text((17, 59), '未充电' if live else '数据暂不可用',
                   font=font(17), fill=INK if live else INK_SOFT)
 
-    # LEFT: one continuous WorkBuddy card with two internal account rows.
-    shaded_box(im, draw, (8, 91, 162, 219), GRAD_WB, BORDER_WB, radius=6)
-    draw.line((17, 155, 153, 155), fill=(198, 94, 16), width=1)
-    wb = data.get('workbuddy', {})
-    accounts = wb.get('accounts', []) if wb.get('status') == 'live' else []
-    for index, (fallback, name_y, value_y) in enumerate(
-            (('账号A', 97, 112), ('账号B', 161, 176))):
-        account = accounts[index] if index < len(accounts) else None
-        name = str((account or {}).get('name', fallback))
-        value = f"{account['balance']:,.0f}" if account else '—'
-        if index == 0:
-            draw.text((17, 95), 'WORKBUDDY', font=numfont(9), fill=INK)
-        right_align(draw, 153, name_y, name, font(10), INK)
-        draw.text((16, value_y), value, font=numfont(30),
-                  fill=INK if account else BAD)
-        right_align(draw, 151, value_y + 24, '积分', font(8), INK)
-
-    # RIGHT: Codex receives more height; DeepSeek only needs one large value.
-    shaded_box(im, draw, (168, 91, 311, 170), GRAD_CODEX, BORDER_CODEX, radius=6)
-    cream = (255, 242, 230)
-    draw.text((177, 95), 'CODEX', font=numfont(12), fill=cream)
+    # 左侧整块给 Codex：它有三行内容（5 小时、本周、重置时间），需要高度。
+    # 标题和两个窗口标签都放大过，太小的字在实物 LCD 上看不清。
+    shaded_box(im, draw, (8, 91, 162, 219), GRAD_CODEX, BORDER_CODEX, radius=6)
+    cream = (255, 240, 236)
+    draw.text((17, 107), 'CODEX', font=numfont(16), fill=cream)
     codex = data.get('codex', {})
     windows = codex.get('windows', []) if codex.get('status') == 'live' else []
     short = next((w for w in windows if w.get('minutes') and w['minutes'] <= 1440), None)
     long = next((w for w in windows if w.get('minutes') and w['minutes'] > 1440), None)
-    right_align(draw, 302, 97, '剩余', font(8), cream)
-    for label, window, y in (('5小时', short, 111), ('本周', long, 133)):
-        draw.text((177, y + 4), label, font=font(10), fill=cream)
-        right_align(draw, 303, y - 1,
-                    f"{window['remaining']:.0f}%" if window else '—',
-                    numfont(23), cream if window else BAD)
-    reset = reset_text(short).split(' · ')[0].replace(' ', '') if short else '重置未知'
-    draw.text((177, 157), '5小时窗口 · ' + reset, font=font(8), fill=cream)
+    right_align(draw, 152, 99, '剩余', font(10), cream)
+    for label, window, cy in (('5小时', short, 136), ('本周', long, 175)):
+        draw.text((17, cy), label, font=font(13), fill=cream, anchor='lm')
+        draw.text((152, cy),
+                  f"{window['remaining']:.0f}%" if window else '—',
+                  font=numfont(28), fill=cream if window else BAD, anchor='rm')
+    reset = reset_short(short) if short else '重置时间未知'
+    draw.text((17, 197), reset, font=font(11), fill=cream)
+
+    # 右上 WorkBuddy：只有两个数字，不需要大块。
+    shaded_box(im, draw, (168, 91, 311, 170), GRAD_WB, BORDER_WB, radius=6)
+    title = 'WORKBUDDY'
+    draw.text((177, 104), title, font=numfont(10), fill=INK, anchor='ls')
+    # 和上面那串字母同一条基线，中文才不会看起来往下掉。
+    draw.text((177 + text_width(draw, title, numfont(10)) + 6, 104),
+              '积分', font=font(9), fill=INK, anchor='ls')
+    wb = data.get('workbuddy', {})
+    accounts = wb.get('accounts', []) if wb.get('status') == 'live' else []
+    for index, (fallback, cy) in enumerate((('账号A', 121), ('账号B', 150))):
+        account = accounts[index] if index < len(accounts) else None
+        name = str((account or {}).get('name', fallback))
+        value = f"{account['balance']:,.0f}" if account else '—'
+        # 名称左中、数字右中，共用一个中心线，两者自动对齐。
+        draw.text((177, cy), name, font=font(11), fill=INK, anchor='lm')
+        size = 19
+        while size > 11 and text_width(draw, value, numfont(size)) > 96:
+            size -= 1
+        draw.text((303, cy), value, font=numfont(size),
+                  fill=INK if account else BAD, anchor='rm')
 
     shaded_box(im, draw, (168, 176, 311, 219), GRAD_DS, BORDER_DS, radius=6)
     draw.text((177, 180), 'DEEPSEEK', font=numfont(10), fill=INK)
@@ -489,8 +578,13 @@ def render(data, pulse=False):
     draw.text((176, 191), f"¥{ds['cny']:.2f}" if ds_ok else '—',
               font=numfont(26), fill=INK if ds_ok else BAD)
 
-    draw.text((9, 225), '余额更新 ' + stamp, font=font(9), fill=DIM)
-    right_align(draw, 311, 225, '额度与账户余额', font(9), DIM)
+    # 底边 240，9 号中文字形实际高度约 13px，再往下会吃掉下半截。
+    # 颜色必须够亮：64 色调色板会把淡灰压成杂色，看起来像被切了一半。
+    draw.text((9, 221), '余额更新 ' + stamp, font=font(11), fill=WHITE)
+    right_align(draw, 311, 221, '额度与账户余额', font(11), WHITE)
+
+    # 四条光带同一节拍运动，按阅读顺序等分相位。
+    synchronized_marquees(draw, RELAY_BOXES, phase, radius=6)
     return im
 
 
@@ -505,18 +599,29 @@ def render_expired():
     return im
 
 
+_PHASE = 0.0
+PHASE_STEP = 0.05   # 一圈 20 秒；四块错开 1/4，正好每 5 秒一拍
+MOTION_FRAMES = 6   # 一秒切成 6 个子帧，运动才不会一跳一格
+
+
 def publish(data):
-    first, second = render(data), render(data, True)
+    global _PHASE
+    phases = [_PHASE + PHASE_STEP * index / MOTION_FRAMES
+              for index in range(MOTION_FRAMES + 1)]
+    motion = [render(data, phase=phase) for phase in phases]
+    _PHASE = (_PHASE + PHASE_STEP) % 1.0
     expired = render_expired()
-    # Same 128-colour Median Cut palette as the Codex build: keeps gradients
-    # intact on the LCD's limited palette and stays well inside the size cap.
-    palette = first.quantize(colors=128, method=Image.Quantize.MEDIANCUT)
-    frames = [palette,
-              second.quantize(palette=palette, dither=Image.Dither.NONE),
-              expired.quantize(palette=palette, dither=Image.Dither.NONE)]
+    # 64 色 Median Cut：渐变还能看，同时给边框运动的增量帧留出体积余量。
+    # （96/80 色配 2px 光带都会超过 24572 字节上限，实测过。）
+    palette = motion[0].quantize(colors=64, method=Image.Quantize.MEDIANCUT)
+    frames = [palette]
+    frames.extend(frame.quantize(palette=palette, dither=Image.Dither.NONE)
+                  for frame in motion[1:])
+    frames.append(expired.quantize(palette=palette, dither=Image.Dither.NONE))
     tmp = GIF.with_suffix('.gif.tmp')
     frames[0].save(tmp, format='GIF', save_all=True,
-                   append_images=frames[1:], duration=[1000, 419000, 60000],
+                   append_images=frames[1:],
+                   duration=[170, 170, 170, 170, 160, 160, 419000, 60000],
                    optimize=True)
     validate_gif(tmp)
     tmp.replace(GIF)
@@ -589,13 +694,20 @@ def main():
     try:
         data = refresh()
         balance_due = time.monotonic() + 60
+        power_due = time.monotonic() + 5
+        # 每秒重画一次是给边框动画用的；余额仍 60 秒、功率仍 5 秒刷新。
         while True:
-            time.sleep(5)
-            if time.monotonic() >= balance_due:
+            time.sleep(1)
+            now = time.monotonic()
+            if now >= balance_due:
                 data = refresh()
-                balance_due = time.monotonic() + 60
-            else:
+                balance_due = now + 60
+                power_due = now + 5
+            elif now >= power_due:
                 refresh_power(data)
+                power_due = now + 5
+            else:
+                publish(data)
     finally:
         server.shutdown()
         server.server_close()

@@ -5,6 +5,7 @@
 而不是把最后一帧冻在那里骗人。
 """
 import io
+import math
 import sys
 from pathlib import Path
 
@@ -20,6 +21,18 @@ FPS = '#78e0b8'
 WHITE = '#e9f0f7'
 MUTED = '#8d9eaf'
 BACKGROUND = '#040809'
+_PATH_CACHE = {}
+_PHASE = 0.0
+PHASE_STEP = 0.05
+MOTION_FRAMES = 6
+RELAY_BOXES = (
+    (8, 55, 208, 101),
+    (214, 55, 311, 101),
+    (8, 108, 156, 174),
+    (163, 108, 311, 174),
+    (8, 181, 156, 237),
+    (163, 181, 311, 237),
+)
 
 # 卡片上那行小字型号，按自己的机器改 config.json 的 hardware.cpu_model / gpu_model
 CPU_MODEL = str(get('hardware', 'cpu_model', default='CPU'))
@@ -47,6 +60,53 @@ def value(number, suffix='', digits=0):
     return '—' if number is None else f'{number:.{digits}f}{suffix}'
 
 
+def border_points(box, radius):
+    key = (*box, radius)
+    if key in _PATH_CACHE:
+        return _PATH_CACHE[key]
+    x0, y0, x1, y1 = box
+    r = radius
+    pts = []
+
+    def seg(ax, ay, bx, by):
+        steps = max(1, int(max(abs(bx - ax), abs(by - ay))))
+        for i in range(steps):
+            t = i / steps
+            pts.append((round(ax + (bx - ax) * t), round(ay + (by - ay) * t)))
+
+    def arc(cx, cy, a0, a1):
+        steps = max(2, int(abs(a1 - a0) * r))
+        for i in range(steps):
+            a = a0 + (a1 - a0) * i / steps
+            pts.append((round(cx + r * math.cos(a)), round(cy + r * math.sin(a))))
+
+    seg(x0 + r, y0, x1 - r, y0)
+    arc(x1 - r, y0 + r, -math.pi / 2, 0)
+    seg(x1, y0 + r, x1, y1 - r)
+    arc(x1 - r, y1 - r, 0, math.pi / 2)
+    seg(x1 - r, y1, x0 + r, y1)
+    arc(x0 + r, y1 - r, math.pi / 2, math.pi)
+    seg(x0, y1 - r, x0, y0 + r)
+    arc(x0 + r, y0 + r, math.pi, math.pi * 1.5)
+    _PATH_CACHE[key] = pts
+    return pts
+
+
+def synchronized_marquees(draw, phase):
+    for beat, (x0, y0, x1, y1) in enumerate(RELAY_BOXES):
+        path = border_points((x0 - 1, y0 - 1, x1 + 1, y1 + 1), 7)
+        total = len(path)
+        runner_head = int(((phase + beat / len(RELAY_BOXES)) % 1.0) * total)
+        span = max(32, int(total * 0.20))
+        for offset in range(span):
+            point = (runner_head - span + 1 + offset) % total
+            progress = offset / max(1, span - 1)
+            fade = progress * progress * (3.0 - 2.0 * progress)
+            color = tuple(round(lo + (hi - lo) * fade)
+                          for lo, hi in zip((178, 190, 204), (255, 255, 255)))
+            draw.line((path[point], path[(point + 1) % total]), fill=color, width=2)
+
+
 def charging_text(charging):
     if not charging:
         return '充电数据 —', ''
@@ -60,8 +120,11 @@ def charging_text(charging):
 
 
 def render(data, sequence):
+    global _PHASE
     frames = []
-    for pulse in (False, True):
+    phases = [_PHASE + PHASE_STEP * index / MOTION_FRAMES
+              for index in range(MOTION_FRAMES + 1)]
+    for phase in phases:
         image = Image.new('RGB', (320, 240), '#09111b')
         draw = ImageDraw.Draw(image)
         draw.text((9, 40), '实时硬件监测', font=font(11), fill='#e2edf8')
@@ -161,17 +224,21 @@ def render(data, sequence):
             if used is not None and total:
                 length = min(130, max(1, round(130 * used / total)))
                 draw.rectangle((x + 9, 219, x + 9 + length, 228), fill=bar)
+        synchronized_marquees(draw, phase)
         frames.append(image)
+    _PHASE = (_PHASE + PHASE_STEP) % 1.0
     stale = Image.new('RGB', (320, 240), BACKGROUND)
     draw = ImageDraw.Draw(stale)
     draw.text((28, 87), '监测数据已过期', font=font(26), fill=GPU)
     draw.text((27, 135), '请保持电脑和网络在线', font=font(19), fill=MUTED)
-    palette = frames[0].quantize(colors=128, method=Image.Quantize.MEDIANCUT)
-    encoded = [palette, frames[1].quantize(palette=palette, dither=Image.Dither.NONE),
-               stale.quantize(palette=palette, dither=Image.Dither.NONE)]
+    palette = frames[0].quantize(colors=64, method=Image.Quantize.MEDIANCUT)
+    encoded = [palette]
+    encoded.extend(frame.quantize(palette=palette, dither=Image.Dither.NONE)
+                   for frame in frames[1:])
+    encoded.append(stale.quantize(palette=palette, dither=Image.Dither.NONE))
     stream = io.BytesIO()
     encoded[0].save(stream, format='GIF', save_all=True, append_images=encoded[1:],
-                    duration=[500, 4500, 60000], optimize=True)
+                    duration=[170, 170, 170, 170, 160, 160, 4000, 60000], optimize=True)
     body = stream.getvalue()
     if len(body) > 24572 or not body.startswith(b'GIF89a'):
         raise RuntimeError('Dashboard outside streaming image bounds')
