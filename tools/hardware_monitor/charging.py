@@ -1,6 +1,6 @@
 """只读取电数据（纯只读，不写设备）。
 
-独立线程每 5 秒问一次云端的四个口，云端卡住也不会拖死界面。
+独立线程每 5 秒问一次云端的四个口及握手协议，云端卡住也不会拖死界面。
 三条铁律：
   1. 任何一次失败都保留上一份有效数据，绝不把「读不到」写成「0 瓦」；
   2. 超过 15 秒没有新数据就判定过期，返回 None，界面显示「—」；
@@ -17,6 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ap01_config import CFG, DEPS, DID as CONFIG_DID, ENV_FILE, UPSTREAM
 
 PORTS = {4: "C1", 7: "C2", 9: "C3", 11: "USB-A"}
+PPS_GEARS = {0xE8: 100, 0x26: 55, 0xC2: 45}  # 与原厂屏实测核对
+PD_GEARS = {0x96: 15}  # 与原厂屏和米家实测核对
+MODES = {1: "AI智配", 2: "极速单充", 3: "均衡输出", 4: "自定义"}
 # hardware.did 优先，没填就用 device.did
 DID = str(CFG.get("hardware", {}).get("did") or CONFIG_DID)
 SAMPLE_SECONDS = 5
@@ -30,6 +33,11 @@ def decode_ports(rows):
     bool 会被 type(v) is int 挡掉，这是 Python 的坑——True 是 int 的子类。
     """
     ports = {}
+    mode = next((MODES.get(r.get("value")) for r in rows if r.get("siid") == 4
+                 and r.get("piid") == 1 and r.get("code") == 0), None)
+    handshake = next((r.get("value") for r in rows if r.get("siid") == 4
+                      and r.get("piid") == 12 and r.get("code") == 0
+                      and type(r.get("value")) is int), None)
     for row in rows:
         value = row.get("value")
         if row.get("siid") != 4 or row.get("piid") not in PORTS or row.get("code") != 0:
@@ -41,10 +49,20 @@ def decode_ports(rows):
         ports[PORTS[row["piid"]]] = {"volts": volts, "amps": amps, "watts": volts * amps}
     if len(ports) != 4:
         return None
+    if handshake is not None:
+        for name, shift in (("C1", 16), ("C2", 0)):
+            code = (handshake >> shift) & 0xFFFF
+            kind, tier = code >> 8, code & 255
+            if ports[name]["watts"] > 0:
+                ports[name]["protocol"] = {7: "PD", 8: "PPS"}.get(kind)
+                ports[name]["gear"] = "5V" if kind == 2 else None
+                ports[name]["gear_watts"] = (PPS_GEARS.get(tier) if kind == 8 else
+                                               PD_GEARS.get(tier) if kind == 7 else None)
     active = [name for name, p in ports.items() if p["watts"] > 0]
     return {
         "at": time.time(),
         "ports": ports,
+        "mode": mode,
         "watts": sum(p["watts"] for p in ports.values()),
         "label": active[0] if len(active) == 1 else "USB",
         "source": "base rounded voltage x current",
@@ -95,7 +113,7 @@ class ChargingReader:
                     response = client.rpc(
                         DID,
                         "get_properties",
-                        [{"did": DID, "siid": 4, "piid": iid} for iid in PORTS],
+                        [{"did": DID, "siid": 4, "piid": iid} for iid in (1, *PORTS, 12)],
                     )
                     data = (
                         decode_ports(response.get("result", []))

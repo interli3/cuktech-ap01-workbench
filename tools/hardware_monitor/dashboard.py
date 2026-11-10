@@ -167,7 +167,8 @@ def render(data, sequence):
         if len(active) == 1:
             name, port = active[0]
             box((8, 55, 208, 101), '#112c35', '#ffffff')
-            draw.text((17, 58), name + ' 输出', font=font(9), fill='#43505d')
+            draw.text((17, 58), name + ' 输出 · ' + (charging.get('mode') or '模式未知'),
+                      font=font(9), fill='#43505d')
             draw.text((16, 79), '≈', font=font(14), fill='#17222d')
             power = value(port['watts'], ' W', 1)
             size = 23
@@ -175,18 +176,26 @@ def render(data, sequence):
                 size -= 1
             draw.text((30, 73), power, font=number(size), fill='#17222d')
             draw.line((125, 62, 125, 94), fill='#8794a0')
-            for y, label, reading in [(58, '电压', value(port['volts'], 'V', 1)),
-                                       (80, '电流', value(port['amps'], 'A', 1))]:
-                draw.text((134, y + 2), label, font=font(8), fill='#53616e')
-                draw.text((201 - draw.textlength(reading, font=number(13)), y), reading,
-                          font=number(13), fill='#17222d')
-            draw.line((133, 78, 201, 78), fill='#8794a0')
+            gear = f"{port['gear_watts']}W" if port.get('gear_watts') else port.get('gear') or '未知'
+            draw.text((132, 58), '档位 ' + gear, font=font(10), fill='#17222d')
+            draw.text((132, 72), '协议 ' + (port.get('protocol') or '未知'),
+                      font=font(10), fill='#17222d')
+            draw.text((132, 86), f"{port['volts']:.1f}V {port['amps']:.1f}A",
+                      font=number(10), fill='#17222d')
         else:
             box((8, 55, 208, 101), '#112c35', '#ffffff')
-            draw.text((17, 58), '总功率' if active else '充电状态', font=font(9), fill='#43505d')
+            draw.text((17, 58), ('总输出 · ' + (charging.get('mode') or '模式未知')) if active
+                      else '充电状态', font=font(9), fill='#43505d')
             if active:
                 draw.text((17, 79), '≈', font=font(16), fill='#17222d')
                 draw.text((34, 73), value(charging['watts'], ' W', 1), font=number(25), fill='#17222d')
+                for index, (name, port) in enumerate(active[:2]):
+                    gear = f"{port['gear_watts']}W" if port.get('gear_watts') else port.get('gear') or '未知'
+                    y = 56 + index * 21
+                    draw.text((127, y), f"{name} {port.get('protocol') or ''} {gear}",
+                              font=font(8), fill='#17222d')
+                    draw.text((127, y + 10), f"{port['volts']:.1f}V {port['amps']:.1f}A",
+                              font=number(9), fill='#17222d')
             else:
                 draw.text((17, 73), '未充电' if charging else '等待充电数据', font=font(19), fill='#17222d')
 
@@ -231,7 +240,7 @@ def render(data, sequence):
     draw = ImageDraw.Draw(stale)
     draw.text((28, 87), '监测数据已过期', font=font(26), fill=GPU)
     draw.text((27, 135), '请保持电脑和网络在线', font=font(19), fill=MUTED)
-    palette = frames[0].quantize(colors=64, method=Image.Quantize.MEDIANCUT)
+    palette = frames[0].quantize(colors=60, method=Image.Quantize.MEDIANCUT)
     encoded = [palette]
     encoded.extend(frame.quantize(palette=palette, dither=Image.Dither.NONE)
                    for frame in frames[1:])

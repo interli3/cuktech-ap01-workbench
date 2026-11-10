@@ -5,6 +5,12 @@
     电流 = 次高字节 / 10
     功率 = 电压 × 电流
 
+同一个 siid=4 服务下还读两个附加属性：
+    piid=1   功率分配模式（1 AI智配 / 2 极速单充 / 3 均衡输出 / 4 自定义）
+    piid=12  C1/C2 握手协议，高 16 位是 C1，低 16 位是 C2
+
+握手值的解码见下面 PPS_GEARS / PD_GEARS 的说明，只识别与原厂屏对得上的编码。
+
 读失败不会写入 0，旧样本超过 15 秒就返回 None。
 """
 from __future__ import annotations
@@ -18,9 +24,23 @@ import ap01_config as cfg
 
 PORTS = {4: "C1", 7: "C2", 9: "C3", 11: "USB-A"}
 
+# 握手半字的低字节 -> 协商档位瓦数。
+# 只收与原厂屏逐条核对过的组合，不做「瓦数 x10 取低字节」的通用反推：
+# 原厂固件能显示带小数的 W，单字节可能有歧义，猜错会把 28W 实际输出标成「28W 档位」。
+PPS_GEARS = {0xE8: 100, 0x26: 55, 0xC2: 45}
+PD_GEARS = {0x96: 15}
+
+MODES = {1: "AI智配", 2: "极速单充", 3: "均衡输出", 4: "自定义"}
+
 
 def decode_ports(rows):
     ports = {}
+    mode = next((MODES.get(row.get("value")) for row in rows
+                 if row.get("siid") == 4 and row.get("piid") == 1
+                 and row.get("code") == 0), None)
+    handshake = next((row.get("value") for row in rows
+                      if row.get("siid") == 4 and row.get("piid") == 12
+                      and row.get("code") == 0 and type(row.get("value")) is int), None)
     for row in rows:
         value = row.get("value")
         if row.get("siid") != 4 or row.get("piid") not in PORTS or row.get("code") != 0:
@@ -37,10 +57,23 @@ def decode_ports(rows):
         }
     if len(ports) != 4:
         return None
+    if handshake is not None:
+        # 只给「此刻确实在输出」的口绑定握手状态：空闲口也会带着上一次的编码，
+        # 直接显示会让人以为没插东西却在跑 100W。
+        for name, shift in (("C1", 16), ("C2", 0)):
+            code = (handshake >> shift) & 0xFFFF
+            kind, tier = code >> 8, code & 255
+            if ports[name]["watts"] <= 0:
+                continue
+            ports[name]["protocol"] = {7: "PD", 8: "PPS"}.get(kind)
+            ports[name]["gear"] = "5V" if kind == 2 else None
+            ports[name]["gear_watts"] = (PPS_GEARS.get(tier) if kind == 8 else
+                                         PD_GEARS.get(tier) if kind == 7 else None)
     active = [name for name, port in ports.items() if port["watts"] > 0]
     return {
         "at": time.time(),
         "ports": ports,
+        "mode": mode,
         "watts": sum(port["watts"] for port in ports.values()),
         "label": active[0] if len(active) == 1 else "USB",
         "source": "base rounded voltage x current",
@@ -91,7 +124,7 @@ class ChargingReader:
                     response = client.rpc(
                         cfg.DID,
                         "get_properties",
-                        [{"did": cfg.DID, "siid": 4, "piid": iid} for iid in PORTS],
+                        [{"did": cfg.DID, "siid": 4, "piid": iid} for iid in (1, *PORTS, 12)],
                     )
                     data = (
                         decode_ports(response.get("result", []))

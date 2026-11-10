@@ -26,6 +26,7 @@ import time
 import urllib.request
 import urllib.error
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from PIL import Image, ImageDraw, ImageFont
@@ -345,7 +346,8 @@ def collect():
             time.sleep(0.5)
     if sample:
         out['power'] = {'status': 'live', 'watts': sample['watts'],
-                        'label': sample['label'], 'ports': sample['ports']}
+                        'label': sample['label'], 'mode': sample.get('mode'),
+                        'ports': sample['ports']}
     else:
         out['power'] = {'status': 'unavailable', 'reason': 'no-fresh-sample'}
     return out
@@ -511,22 +513,31 @@ def render(data, pulse=False, phase=0.0):
               if p['watts'] > 0] if live else []
     if len(active) == 1:
         name, port = active[0]
-        draw.text((17, 46), name + ' 输出', font=font(9), fill=INK_SOFT)
-        draw.text((16, 61), '≈', font=font(14), fill=INK)
+        draw.text((17, 46), name + ' 输出 · ' + (power.get('mode') or '模式未知'),
+                  font=font(9), fill=INK_SOFT)
         reading = f"{port['watts']:.1f} W"
         size = 25
         while text_width(draw, reading, numfont(size)) > 147:
             size -= 1
-        draw.text((32, 56), reading, font=numfont(size), fill=INK)
+        draw.text((17, 56), reading, font=numfont(size), fill=INK)
         draw.line((190, 51, 190, 77), fill=HAIRLINE, width=1)
-        for y, label, value in ((47, '电压', f"{port['volts']:.1f} V"),
-                                 (65, '电流', f"{port['amps']:.1f} A")):
-            draw.text((201, y), label, font=font(9), fill=INK_SOFT)
-            right_align(draw, 302, y - 1, value, numfont(14), INK)
+        gear = f"{port['gear_watts']}W" if port.get('gear_watts') else port.get('gear') or '未知'
+        draw.text((199, 44), '档位 ' + gear, font=font(10), fill=INK)
+        draw.text((199, 58), '协议 ' + (port.get('protocol') or '未知'), font=font(10), fill=INK)
+        draw.text((199, 72), f"{port['volts']:.1f}V {port['amps']:.1f}A",
+                  font=numfont(10), fill=INK)
     elif len(active) > 1:
-        draw.text((17, 47), '总输出', font=font(10), fill=INK_SOFT)
+        draw.text((17, 47), '总输出 · ' + (power.get('mode') or '模式未知'),
+                  font=font(10), fill=INK_SOFT)
         draw.text((90, 61), '≈', font=font(14), fill=INK)
         draw.text((108, 52), f"{power['watts']:.1f} W", font=numfont(28), fill=INK)
+        for index, (name, port) in enumerate(active[:2]):
+            gear = f"{port['gear_watts']}W" if port.get('gear_watts') else port.get('gear') or '未知'
+            y = 43 + index * 21
+            draw.text((220, y), f"{name} {port.get('protocol') or ''} {gear}",
+                      font=font(8), fill=INK)
+            draw.text((220, y + 10), f"{port['volts']:.1f}V {port['amps']:.1f}A",
+                      font=numfont(9), fill=INK)
     else:
         draw.text((17, 46), '充电输出', font=font(9), fill=INK_SOFT)
         draw.text((17, 59), '未充电' if live else '数据暂不可用',
@@ -613,7 +624,7 @@ def publish(data):
     expired = render_expired()
     # 64 色 Median Cut：渐变还能看，同时给边框运动的增量帧留出体积余量。
     # （96/80 色配 2px 光带都会超过 24572 字节上限，实测过。）
-    palette = motion[0].quantize(colors=64, method=Image.Quantize.MEDIANCUT)
+    palette = motion[0].quantize(colors=56, method=Image.Quantize.MEDIANCUT)
     frames = [palette]
     frames.extend(frame.quantize(palette=palette, dither=Image.Dither.NONE)
                   for frame in motion[1:])
@@ -642,12 +653,16 @@ def refresh():
 
 
 def refresh_power(data):
-    """Copy the independent five-second charging sample into the next GIF."""
+    """把独立五秒线程的充电样本复制进下一帧。
+
+    mode 必须跟着一起复制，否则卡片标题会一直停在「模式未知」。
+    """
     reader = power_reader()
     sample = reader.sample() if reader else None
     if sample:
         data['power'] = {'status': 'live', 'watts': sample['watts'],
-                         'label': sample['label'], 'ports': sample['ports']}
+                         'label': sample['label'], 'mode': sample.get('mode'),
+                         'ports': sample['ports']}
     else:
         data['power'] = {'status': 'unavailable', 'reason': 'no-fresh-sample'}
     return publish(data)
@@ -691,24 +706,46 @@ def main():
     server = ThreadingHTTPServer((BIND, PORT), make_balance_handler(GIF))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log(event='server_started', bind=BIND, port=PORT)
+    # 先把充电采集线程支起来，别让它排在账户请求后面，否则第一帧充电位是空的。
+    power_reader()
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
         data = refresh()
         balance_due = time.monotonic() + 60
         power_due = time.monotonic() + 5
+        balance_future = None
         # 每秒重画一次是给边框动画用的；余额仍 60 秒、功率仍 5 秒刷新。
+        #
+        # 关键：余额刷新放到后台线程做。collect() 要依次请求 Codex、WorkBuddy、
+        # DeepSeek 三个源，网络慢的时候会卡十几秒；以前它跑在主循环里，
+        # 这段时间既不重绘也不复制充电样本，表现就是「功率数字半天不动」。
+        # 放到后台后主循环始终每秒走一圈，充电读数不再被账户请求拖住。
         while True:
             time.sleep(1)
             now = time.monotonic()
-            if now >= balance_due:
-                data = refresh()
+            if balance_future and balance_future.done():
+                try:
+                    updated = balance_future.result()
+                    # 只回写账户字段。整份 data 覆盖会把主循环刚更新的充电样本
+                    # 换成后台线程启动时的旧值，等于白回退 60 秒。
+                    for name in ('codex', 'workbuddy', 'deepseek'):
+                        data[name] = updated[name]
+                    data['checked_at'] = updated['checked_at']
+                    log(statuses={name: data[name].get('status') for name in
+                                  ('codex', 'workbuddy', 'deepseek')})
+                except Exception as error:
+                    log(event='balance_refresh_failed', reason=type(error).__name__)
+                balance_future = None
+            if now >= balance_due and balance_future is None:
+                balance_future = executor.submit(collect)
                 balance_due = now + 60
-                power_due = now + 5
-            elif now >= power_due:
+            if now >= power_due:
                 refresh_power(data)
                 power_due = now + 5
             else:
                 publish(data)
     finally:
+        executor.shutdown(wait=False)
         server.shutdown()
         server.server_close()
 
