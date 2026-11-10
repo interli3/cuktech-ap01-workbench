@@ -1,0 +1,14 @@
+# 本地配置和运行产物，不要提交
+config.json
+run/
+runtime/
+build/
+__pycache__/
+*.pyc
+*.log
+current.json
+screen.gif
+probe.gif
+probe.png
+preview.png
+*.jsonl

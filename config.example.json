@@ -1,0 +1,49 @@
+{
+  "device": {
+    "did": "1234567890",
+    "model": "njcuk.enstor.ap01",
+    "hw_ver": "BL618-BL4",
+    "device_ip": "192.168.1.50"
+  },
+  "network": {
+    "bind": "192.168.1.160",
+    "display_port": 18766
+  },
+  "upstream": {
+    "repo": "F:/path/to/cuktech-ap01-firmware-tools",
+    "deps": "",
+    "env_file": "env/mi-cloud.env"
+  },
+  "firmware": {
+    "stock_0031": "firmware/原厂_0031.bin",
+    "downgrade_0031": "firmware/降级用_0031_首字节预反转.bin",
+    "loader": "firmware/加载器_0031_18766_账户余额.bin",
+    "loader_sha256": "cd79f6863db8df8ee4b0bb24753a4cd549f904fa69f84458585c219b6b1e8343"
+  },
+  "paths": {
+    "state_dir": "run",
+    "journal_dir": "run"
+  },
+  "hardware": {
+    "did": "",
+    "port": 18765,
+    "dash_port": 0,
+    "presentmon": "",
+    "lhm_dll": "",
+    "cpu_model": "My CPU",
+    "gpu_model": "My GPU",
+    "art_dir": "runtime/loader-install",
+    "log_dir": "runtime/logs",
+    "ignore_processes": []
+  },
+  "sources": {
+    "workbuddy_snapshot": "http://127.0.0.1:8791/snapshot",
+    "deepseek_endpoint": "https://api.deepseek.com/user/balance",
+    "deepseek_key_store": "run/deepseek_key.bin",
+    "codex_bin_root": "%LOCALAPPDATA%/OpenAI/Codex/bin"
+  },
+  "allowed_dids": {
+    "1234567890": "示例 DID，请换成你自己的",
+    "0987654321": "另一台的示例 DID，只有一块屏就删掉这行"
+  }
+}
