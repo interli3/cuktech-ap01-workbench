@@ -93,9 +93,9 @@
 - **界面定稿**：银白金属充电卡与功率、电压电流合并为一卡；帧率卡归到 GPU 上方；
   CPU/GPU 增加真实风扇 RPM（不用控制百分比冒充）；128 色 Median Cut 渐变，
   GIF 稳定在 24572 字节上限内，5 秒过期判定没有放宽。
-- **断网自恢复**：服务改绑 `0.0.0.0`，解决开机早于 Wi-Fi 时 `WinError 10049`
-  导致两块屏一起显示「数据已过期」；再加每分钟端口守护，实测人为停掉两个服务后
-  1 分钟内自动恢复。脚本见 `tools/screen_service_watchdog.py`。
+- **断网自恢复**：开机时服务可能早于 Wi-Fi 就绪而启动失败；加了每分钟端口守护，
+  自动重试到网络就绪为止。实测人为停掉两个服务后 1 分钟内恢复。
+  脚本见 `tools/screen_service_watchdog.py`。
 - **宣传物料**：52 秒横版宣传片三版与社交媒体 5 图、两版文案，生成工程在 `video/`。
 
 完整数据、演练时间线和未覆盖范围见
@@ -121,7 +121,7 @@
 各占一个端口、各用一份事务文件，其余流程完全一样，见
 [docs/07-一块屏的两种模式.md](docs/07-一块屏的两种模式.md)。
 
-**模式 A · 硬件监控台**
+**模式 A · 硬件监控台（截图使用示例数据）**
 
 ![硬件监控台](images/mode-a-hardware.png)
 
@@ -222,9 +222,26 @@ copy config.example.json config.json
 |---|---|
 | `device.did` | 这块屏的 DID（纯数字，第 2 步的体检命令会告诉你） |
 | `device.device_ip` | 这块屏在局域网的 IP |
-| `network.bind` | **你电脑**的局域网 IP，别填 `0.0.0.0`，屏要主动访问你 |
+| `network.bind` | **你电脑**的局域网 IP。必须填真实地址，不要填 `0.0.0.0`：装加载器时脚本要用它生成「设备来下载固件」的地址 |
 | `upstream.repo` | 上游 `cuktech-ap01-firmware-tools` 在你电脑上的绝对路径 |
 | `allowed_dids` | 把示例 DID 换成你自己的；回原厂脚本只认这个白名单 |
+
+> 🔴 **地址三处必须一致，这是最容易漏的一步**：
+> 预编译加载器里写死的是 `http://192.168.1.160:<端口>/live.bin`。
+> 二选一：
+>
+> 1. **推荐**：在路由器里把电脑固定为 `192.168.1.160`，什么都不用改；
+> 2. 改加载器里的地址（**新旧地址长度必须完全相同**，否则只能重新编译加载器）：
+>
+> ```bash
+> python tools/patch_firmware.py patch-url --in firmware/加载器_0031_18766_账户余额.bin --out build/loader.bin --old http://192.168.1.160:18766/live.bin --new http://192.168.1.101:18766/live.bin
+> ```
+>
+> 命令会打印新固件的 SHA256。**把这串值填回 `config.json` 的
+> `firmware.loader_sha256`**，并把 `firmware.loader` 指向新文件，
+> 否则第 4 步安装脚本按哈希校验会直接拒绝。`config.json` 的 `network.bind`
+> 填同一个电脑 IP。示例里的 `192.168.1.101` 请换成你自己电脑的地址，
+> 位数必须和 `192.168.1.160` 一样。
 
 **顺便在这里选好模式**（样例配置默认是模式 B）：
 
@@ -325,9 +342,9 @@ python tools/install_loader.py --execute-once
 不要用「系统服务」方式——DeepSeek 的密钥用 DPAPI 加密，绑的是当前登录用户，
 服务账户读不出来。
 
-**再加一层守护（建议）**：登录时服务可能早于 Wi-Fi 就绪，导致绑定固定地址失败。
-显示服务监听 `0.0.0.0` 可以消除这个竞态；再建一个每分钟触发的任务，
-用 `pythonw.exe` 跑 `tools/screen_service_watchdog.py`，端口掉了自动重启对应任务：
+**再加一层守护（建议）**：登录时服务可能早于 Wi-Fi 就绪，绑定局域网地址会报
+`WinError 10049` 并退出。建一个每分钟触发的任务，用 `pythonw.exe` 跑
+`tools/screen_service_watchdog.py`，端口掉了就重启对应任务，网络一就绪就自动恢复：
 
 ```
 pythonw.exe tools/screen_service_watchdog.py --service 18765=你的模式A任务名 --service 18766=你的模式B任务名

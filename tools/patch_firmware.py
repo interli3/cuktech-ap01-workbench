@@ -70,6 +70,7 @@ def cmd_patch_url(args) -> None:
     patched = patched[:-4] + crc.to_bytes(4, "little")
     print(f"替换 {count} 处 URL：{args.old} -> {args.new}")
     print(f"尾部 CRC 重算为 {crc:#010x}")
+    print("请把下面输出的 SHA256 填回 config.json 的 firmware.loader_sha256，否则安装会被拒绝。")
     write(Path(args.output), patched)
 
 
