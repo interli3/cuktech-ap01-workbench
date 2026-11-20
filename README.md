@@ -66,7 +66,7 @@
 - **模式 A｜硬件监控台**：CPU/GPU 功率温度、占用、风扇转速、内存显存、
   游戏帧率、四个充电口的实时功率；
 - **模式 B｜账户工作台**：Codex 额度与重置时间、WorkBuddy 两个账号积分、
-  DeepSeek 余额、充电端口的电压电流。
+  DeepSeek 余额、可选的 Grok 周额度、充电端口的电压电流。
 
 **默认只需要一块屏。** 两种模式共用同一套 0031 固件、同一套降级流程，
 区别只有三处：装哪个加载器、电脑上跑哪个服务、走哪个端口。
@@ -85,6 +85,20 @@
 > 是更高版本且不可逆，**不要**把它当成降级目标。详见
 > [docs/03-0055-未知状态.md](docs/03-0055-未知状态.md) 和
 > [docs/09-风险与未验证.md](docs/09-风险与未验证.md)。
+
+## 最近更新（2026-11-20）
+
+- **账户屏加上第五张卡：Grok 周额度**。左上 Codex 缩成「5 小时 / 本周」并排，
+  左下是石墨底的 GROK 卡：大号白字剩余百分比、「本周剩余」、琥珀色重置倒计时。
+  这张卡不用绿色，也不用紫色。
+- **数字由显示服务自己向 Cursor 查询**，不唤醒 Grok Bot，不消耗 bot 额度，
+  也不读桌面端的 `sand-secrets.json`。一次性登录脚本是 `tools/grok_cursor_auth.py`。
+- **查不到就一直显示上一次的数字**。缓存超过大约 30 分钟，数字还在，说明改成
+  「x时前更新」。只有完全没有缓存，或者重置时间已经过了，才显示「—」。
+  还没授权时显示「未授权 / —」，服务不会因此退出。失败不会被写成 0。
+- **GIF 调色板按体积自动降档**：56、44、36、28 色，保证单帧不超过 24572 字节。
+  不想要这张卡时，把 `sources.grok_enabled` 设为 `false`，重启后回到四卡布局。
+- 原理、授权步骤和风险见 [docs/14-Grok额度卡片.md](docs/14-Grok额度卡片.md)。
 
 ## 最近更新（2026-11-11）
 
@@ -130,7 +144,7 @@
 
 | | 模式 A · 硬件监控台 | 模式 B · 账户工作台 |
 |---|---|---|
-| 屏幕上显示 | CPU/GPU 功率、温度、占用、风扇转速；内存、显存；游戏 FPS；C1/C2/C3/USB-A 充电数据（实际 W、协商档位、协议、V/A、分配模式） | WorkBuddy 两个账号积分；Codex 5 小时/本周剩余额度与重置时间；DeepSeek 人民币余额；充电端口、实际功率、协商档位、协议、电压、电流、分配模式 |
+| 屏幕上显示 | CPU/GPU 功率、温度、占用、风扇转速；内存、显存；游戏 FPS；C1/C2/C3/USB-A 充电数据（实际 W、协商档位、协议、V/A、分配模式） | WorkBuddy 两个账号积分；Codex 5 小时/本周剩余额度与重置时间；Grok 本周剩余百分比与重置倒计时；DeepSeek 人民币余额；充电端口、实际功率、协商档位、协议、电压、电流、分配模式 |
 | 电脑上跑 | `tools/hardware_monitor/runtime.py`，端口 `18765` | `tools/display_service.py`，端口 `18766` |
 | 屏里装 | `加载器_0031_18765_硬件监测.bin` | `加载器_0031_18766_账户余额.bin` |
 | 额外依赖 | MSI Afterburner（带 RTSS），用来读传感器和帧率 | 无，装完 Python 包就能跑 |
@@ -152,13 +166,19 @@
 
 **模式 B · 账户工作台（截图使用示例数据）**
 
-![账户工作台](images/mode-b-account.png)
+默认五张卡。左下石墨卡是 Grok 本周剩余；Codex 缩在左上，5 小时和本周并排。
+图里的账号名和数字都是示例。
 
-模式 B 还支持多口同时输出和整块数据不可用两种状态：
+![账户工作台，含 Grok 卡](images/mode-b-grok.png)
 
-| 多口同时充电 | 数据源全部不可用 |
+多口同时输出，以及还没配数据源时的样子（Grok 未授权显示「未授权 / —」，其它源显示「—」，不填 0）：
+
+| 多口同时充电 | 数据源还没配上 |
 |---|---|
-| ![多口](images/mode-b-account-multi.png) | ![不可用](images/mode-b-account-unavailable.png) |
+| ![多口](images/mode-b-grok-multi.png) | ![未授权与不可用](images/mode-b-grok-unavailable.png) |
+
+`sources.grok_enabled` 设为 `false` 后，Codex 回到左侧整块，屏幕恢复四张卡。
+更早的四卡截图还留在 `images/mode-b-account.png`。
 
 两种模式的详细能力和实测边界见 [docs/07-一块屏的两种模式.md](docs/07-一块屏的两种模式.md)，
 模式 A 的传感器怎么接、每个数字从哪来见 [docs/12-硬件监测模式.md](docs/12-硬件监测模式.md)。
@@ -191,6 +211,7 @@
        ├── Codex app-server（额度）
        ├── WorkBuddy 本机快照（两个账号积分）
        ├── DeepSeek 余额接口（DPAPI 加密密钥）
+       ├── Cursor GetSandUsageStatus（Grok 周额度，可关，独立登录）
        └── 小米云 RPC（充电功率 siid=4）
 ```
 
@@ -338,9 +359,11 @@ python tools/hardware_monitor/runtime.py
 模式 A 把端口换成 `18765` 同样验证一遍。模式 A 第一次跑会先黑 2～3 秒
 （在打开传感器库），属于正常。
 
-> 模式 B 第一次跑，「Codex / WorkBuddy / DeepSeek」那几块大概率显示「不可用」，
-> 因为还没配数据源。这是正常的——先把图跑出来，数据源见
-> [docs/06-电脑端显示服务.md](docs/06-电脑端显示服务.md)，配好再重启服务。
+> 模式 B 第一次跑，「Codex / WorkBuddy / DeepSeek」那几块大概率显示「—」，
+> Grok 卡显示「未授权 / —」，因为还没配数据源。这是正常的——先把图跑出来。
+> 数据源见 [docs/06-电脑端显示服务.md](docs/06-电脑端显示服务.md)，
+> Grok 的一次性登录见 [docs/14-Grok额度卡片.md](docs/14-Grok额度卡片.md)。
+> 不想要 Grok 卡就把 `sources.grok_enabled` 设为 `false`。
 
 浏览器能打开、屏幕打不开 → 是防火墙没放行，先解决防火墙，不要重刷设备。
 
@@ -406,6 +429,7 @@ cuktech-ap01-workbench/
 │   ├── restore_factory.py
 │   ├── power_reader.py
 │   ├── credentials.py        DeepSeek 密钥（DPAPI 加密存本机）
+│   ├── grok_cursor_auth.py   Grok 周额度：一次性 Cursor 登录（DPAPI）
 │   ├── display_service.py    模式 B：额度/余额/充电
 │   ├── screen_service_watchdog.py  每分钟探活，端口掉了重启对应计划任务
 │   └── hardware_monitor/     模式 A：CPU/GPU/内存/帧率/充电
@@ -426,7 +450,8 @@ cuktech-ap01-workbench/
     ├── 09-风险与未验证.md
     ├── 10-常见问题.md
     ├── 12-硬件监测模式.md
-    └── 13-1110-稳定性与界面定稿.md
+    ├── 13-1110-稳定性与界面定稿.md
+    └── 14-Grok额度卡片.md
 ```
 
 > 📌 预编译加载器里的电脑地址是 `192.168.1.160`。如果你的电脑不是这个地址，
@@ -458,6 +483,9 @@ python tools/patch_firmware.py verify --dir firmware
 
 - DeepSeek 或任何 API 密钥。密钥用 Windows 的加密接口存在你自己电脑的
   `run/deepseek_key.bin`，只有当前登录用户能解开，从不进仓库；
+- Cursor 的 access token / refresh token。Grok 卡的登录凭据加密存在
+  `run/grok_cursor_auth.bin`，用量缓存在 `run/grok_usage.json`。
+  这两个文件名写在 `.gitignore` 里，改了 `state_dir` 也不会被提交；
 - 米家账号密码、登录态。`env/mi-cloud.env` 留在上游仓库里，
   被它自己的忽略规则挡住，本仓库既不读取内容也不上传；
 - 设备的真实 DID。配置样例里是 `1234567890` / `0987654321` 两个假值；

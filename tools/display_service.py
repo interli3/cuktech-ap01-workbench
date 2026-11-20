@@ -5,11 +5,15 @@
   /live.bin     stream-v2 长连接，300 块 x 24576 字节，每秒一块
   /health       运行状态和设备诊断
 
-数据源：Codex app-server、WorkBuddy 本机快照、DeepSeek 余额接口。
-读取失败显示“不可用”，绝不伪造 0。
+数据源：Codex app-server、WorkBuddy 本机快照、DeepSeek 余额接口，
+以及可选的 Grok 周额度（Cursor Dashboard 的 GetSandUsageStatus）。
+Grok 这一路是显示服务自己的只读登录，不读 Grok Bot 桌面端的
+sand-secrets.json，也不消耗 bot 额度。
+读取失败显示“不可用”或“未授权”，绝不伪造 0。
 """
 from pathlib import Path
 import argparse
+import base64
 import datetime
 import io
 import json
@@ -32,7 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from PIL import Image, ImageDraw, ImageFont
 
 import ap01_config as cfg
-from credentials import get_key
+from credentials import get_key, protect, unprotect
 from power_reader import ChargingReader
 
 ROOT = cfg.STATE_DIR
@@ -54,10 +58,49 @@ DS_ENDPOINT = cfg.get('sources', 'deepseek_endpoint',
                       default='https://api.deepseek.com/user/balance')
 
 
+def _as_bool(value, default=True):
+    """配置里的开关。缺省用 default；字符串 "false" 不能被 bool() 当成真。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def _refuse_bot_secrets(path):
+    """独立登录的凭据文件，不允许指到 Grok Bot 桌面端的 sand-secrets.json。"""
+    if 'sand-secrets' in Path(path).name.lower():
+        raise RuntimeError('refusing sand-secrets.json')
+
+
+# Grok 周额度。路径和开关都走 config.json；接口地址有默认值，方便上游改路径时只改配置。
+# 这一路绝不能去读 Grok Bot 桌面端的 sand-secrets.json，那是另一次登录。
+GROK_ENABLED = _as_bool(cfg.get('sources', 'grok_enabled', default=True), default=True)
+GROK_FILE = cfg.resolve(cfg.get('sources', 'grok_cache', default='run/grok_usage.json'))
+GROK_AUTH_STORE = cfg.resolve(cfg.get('sources', 'grok_auth_store',
+                                      default='run/grok_cursor_auth.bin'))
+GROK_AUTH_STATUS = cfg.resolve(cfg.get('sources', 'grok_auth_status',
+                                       default='run/grok_auth_status.json'))
+GROK_API = str(cfg.get(
+    'sources', 'grok_usage_url',
+    default='https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus'))
+GROK_REFRESH_URL = str(cfg.get(
+    'sources', 'grok_refresh_url',
+    default='https://api2.cursor.sh/auth/exchange_user_api_key'))
+GROK_POLL_S = 300             # 真正打到接口上，最多 5 分钟一次；启动后的第一次不等
+GROK_RENEW_BEFORE_S = 7 * 86400
+GROK_HINT_AGE_S = 30 * 60     # 缓存比这更旧：数字照常显示，说明改成「x时前更新」
+_GROK = {'next_due': 0.0, 'reauth_logged': False}
+# /live.bin 每个槽 24576 字节，含 4 字节长度，GIF 本体不能超过 24572。
+STREAM_GIF_MAX = 24572
+
+
 def validate_gif(path):
     """设备端只接受 320x240、至少两帧、单帧不超过 24572 字节的 GIF89a。"""
     body = Path(path).read_bytes()
-    if len(body) > 24572 or not body.startswith(b'GIF89a') or not body.endswith(b';'):
+    if len(body) > STREAM_GIF_MAX or not body.startswith(b'GIF89a') or not body.endswith(b';'):
         raise RuntimeError('GIF must be GIF89a, <=24572 bytes, with a valid trailer')
     with Image.open(path) as image:
         if image.size != (320, 240) or image.n_frames < 2:
@@ -90,14 +133,18 @@ GRAD_SILVER = ((247, 250, 252), (174, 185, 196))   # charging, only neutral area
 GRAD_WB = ((255, 193, 35), (255, 98, 22))          # WorkBuddy, one card / two rows
 GRAD_CODEX = ((146, 32, 40), (58, 12, 18))         # Codex, dark crimson -> deep wine
 GRAD_DS = ((53, 224, 255), (10, 107, 240))         # DeepSeek, cyan -> blue
+GRAD_GROK = ((74, 84, 98), (18, 22, 30))           # Grok，石墨到近黑，不用绿也不用紫
 GRAD_FOOT = ((41, 68, 87), (24, 46, 64))
 BORDER_SILVER = (255, 255, 255)
 BORDER_WB = (255, 233, 194)
 BORDER_CODEX = (255, 168, 162)
 BORDER_DS = (207, 246, 255)
+BORDER_GROK = (236, 241, 246)
 BORDER_FOOT = (62, 86, 107)
 HAIRLINE = (135, 148, 160)
 STREAM_FRAMES = 300
+# 五张卡加跑马灯时 56 色可能超过 24572。从多到少试，记住上次放得下的那一档。
+PALETTE_STEPS = (56, 44, 36, 28)
 
 
 def make_balance_handler(gif_path):
@@ -325,14 +372,272 @@ def fetch_deepseek():
     return {'status': 'live', 'cny': float(cny['total_balance'])}
 
 
+def _pct(value):
+    value = float(value)
+    if not (0 <= value <= 100) or math.isnan(value):
+        raise ValueError('percent out of range')
+    return value
+
+
+def _grok_post(url, bearer, timeout=12):
+    """只读 POST，body 固定是 {}。Bearer 只放进请求头，不进日志。"""
+    request = urllib.request.Request(url, data=b'{}', method='POST', headers={
+        'Authorization': 'Bearer ' + bearer, 'Content-Type': 'application/json',
+        'connect-protocol-version': '1', 'Accept': 'application/json'})
+    with urllib.request.urlopen(request, timeout=timeout,
+                                context=ssl.create_default_context()) as response:
+        return json.load(response)
+
+
+def _grok_load_auth():
+    _refuse_bot_secrets(GROK_AUTH_STORE)
+    if not GROK_AUTH_STORE.is_file():
+        raise FileNotFoundError('grok auth missing')
+    creds = json.loads(unprotect(GROK_AUTH_STORE.read_bytes()))
+    if not isinstance(creds, dict) or not creds.get('accessToken') or not creds.get('refreshToken'):
+        raise ValueError('grok auth incomplete')
+    return creds
+
+
+def _grok_jwt_exp(token):
+    try:
+        part = token.split('.')[1]
+        part += '=' * (-len(part) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(part))['exp'])
+    except Exception:
+        return None
+
+
+def _atomic_write(path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def _grok_auth_status(status, **extra):
+    """状态文件只写状态和时间，不写 token。"""
+    payload = {'status': status,
+               'updated_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds')}
+    payload.update(extra)
+    _refuse_bot_secrets(GROK_AUTH_STATUS)
+    _atomic_write(GROK_AUTH_STATUS, json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8'))
+
+
+def _grok_note_reauth(reason):
+    if _GROK['reauth_logged']:
+        return
+    _GROK['reauth_logged'] = True
+    try:
+        log(event='grok_auth_needed', reason=str(reason)[:80])
+    except Exception:
+        pass
+    try:
+        _grok_auth_status('needs_reauth', reason=str(reason)[:80])
+    except Exception:
+        pass
+
+
+def _grok_refresh(creds):
+    """用 refresh token 换新的 access token。响应里没有新 refresh token 就留着旧的。"""
+    try:
+        reply = _grok_post(GROK_REFRESH_URL, creds['refreshToken'], timeout=15)
+        access = reply.get('accessToken')
+        if not isinstance(access, str) or not access.strip():
+            raise ValueError('no accessToken')
+        new_refresh = reply.get('refreshToken')
+        fresh = dict(creds, accessToken=access,
+                     refreshToken=new_refresh if isinstance(new_refresh, str) and new_refresh
+                     else creds['refreshToken'],
+                     access_exp=_grok_jwt_exp(access),
+                     refreshed_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+        _refuse_bot_secrets(GROK_AUTH_STORE)
+        _atomic_write(GROK_AUTH_STORE, protect(json.dumps(fresh)))
+        exp = fresh.get('access_exp')
+        _grok_auth_status('authorized', refreshed_at=fresh['refreshed_at'],
+                          access_token_expires_at=datetime.datetime.fromtimestamp(exp).astimezone()
+                          .isoformat(timespec='seconds') if exp else None)
+        _GROK['reauth_logged'] = False
+        log(event='grok_token_refreshed')
+        return fresh
+    except Exception as error:
+        reason = (f'HTTP {error.code}' if isinstance(error, urllib.error.HTTPError)
+                  else type(error).__name__)
+        _grok_note_reauth(reason)
+        return None
+
+
+def _grok_query_api():
+    """一次 GetSandUsageStatus。任何字段不对就抛错，调用方继续用缓存，不填 0。"""
+    creds = _grok_load_auth()
+    exp = creds.get('access_exp') or _grok_jwt_exp(creds['accessToken'])
+    if exp and exp - time.time() < GROK_RENEW_BEFORE_S:
+        creds = _grok_refresh(creds) or creds
+    try:
+        raw = _grok_post(GROK_API, creds['accessToken'])
+    except urllib.error.HTTPError as error:
+        if error.code not in (401, 403):
+            raise
+        creds = _grok_refresh(creds)
+        if not creds:
+            raise PermissionError('needs_reauth')
+        try:
+            raw = _grok_post(GROK_API, creds['accessToken'])
+        except urllib.error.HTTPError as again:
+            if again.code in (401, 403):
+                _grok_note_reauth(f'HTTP {again.code}')
+                raise PermissionError('needs_reauth')
+            raise
+    if not isinstance(raw, dict) or raw.get('usagePercent') is None:
+        raise ValueError('usagePercent missing')
+    used = _pct(raw['usagePercent'])
+    stamp = raw.get('nextResetTimestampUtc')
+    if not stamp:
+        raise ValueError('nextResetTimestampUtc missing')
+    resets = datetime.datetime.fromisoformat(str(stamp).replace('Z', '+00:00'))
+    if resets.tzinfo is None:
+        raise ValueError('reset needs an offset')
+    out = {'used': used, 'resets': resets.astimezone()}
+    cents = raw.get('prepaidAvailableCents')
+    if cents is not None:
+        out['credits_usd'] = round(float(cents) / 100, 2)
+    return out
+
+
+def _grok_write_cache(api):
+    previous = {}
+    try:
+        previous = json.loads(GROK_FILE.read_text(encoding='utf-8-sig'))
+    except Exception:
+        pass
+    used = round(api['used'], 3)
+    cache = {'status': 'live',
+             'checked_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+             'source': 'api',
+             'plan': previous.get('plan') if isinstance(previous, dict) else None,
+             'used_percent': used,
+             'remaining_percent': round(100 - used, 3),
+             'resets_at': api['resets'].isoformat(timespec='seconds'),
+             'resets_at_unix': int(api['resets'].timestamp()),
+             'credits_usd': api.get('credits_usd', previous.get('credits_usd')
+                                    if isinstance(previous, dict) else None),
+             'note': 'GetSandUsageStatus, read by the display service'}
+    _refuse_bot_secrets(GROK_FILE)
+    _atomic_write(GROK_FILE, json.dumps(cache, ensure_ascii=False, indent=2).encode('utf-8'))
+
+
+def _grok_from_cache():
+    """上次成功的数字。放多久都还能用；只有没有文件，或重置时间已经过了，才不能用。"""
+    _refuse_bot_secrets(GROK_FILE)
+    if not GROK_FILE.is_file():
+        raise FileNotFoundError('grok_usage.json missing')
+    raw = json.loads(GROK_FILE.read_text(encoding='utf-8-sig'))
+    if not isinstance(raw, dict) or raw.get('status') != 'live':
+        raise ValueError('source status not live')
+    checked = datetime.datetime.fromisoformat(str(raw['checked_at']))
+    if checked.tzinfo is None:
+        raise ValueError('checked_at needs an offset')
+    now = datetime.datetime.now().astimezone()
+    age = (now - checked).total_seconds()
+    if age < -300:
+        raise ValueError('checked_at in the future')
+    used = _pct(raw['used_percent']) if raw.get('used_percent') is not None else None
+    remaining = _pct(raw['remaining_percent']) if raw.get('remaining_percent') is not None else None
+    if remaining is None and used is None:
+        raise ValueError('no percentage')
+    if remaining is None:
+        remaining = 100 - used
+    if used is not None and abs(used + remaining - 100) > 0.5:
+        raise ValueError('used + remaining != 100')
+    if raw.get('resets_at'):
+        resets = datetime.datetime.fromisoformat(str(raw['resets_at']))
+        if resets.tzinfo is None:
+            raise ValueError('resets_at needs an offset')
+        resets_unix = resets.timestamp()
+    elif raw.get('resets_at_unix') is not None:
+        resets_unix = float(raw['resets_at_unix'])
+    else:
+        resets_unix = None
+    if resets_unix is not None and resets_unix < now.timestamp():
+        raise TimeoutError('reset_passed')
+    out = {'status': 'live', 'remaining': remaining, 'used': used,
+           'resets_at': resets_unix, 'plan': raw.get('plan'),
+           'checked_at': checked.isoformat(timespec='seconds'), 'age_s': max(0, int(age))}
+    if raw.get('credits_usd') is not None:
+        out['credits_usd'] = float(raw['credits_usd'])
+    return out
+
+
+def fetch_grok():
+    """Grok 周额度。接口最多 5 分钟打一次；失败就退回缓存。
+
+    没有凭据、也没有能用的缓存时，返回 unauthorized，不抛给主循环。
+    有缓存就一直显示那个数，哪怕这次接口失败，也不改成 0。
+    """
+    if not GROK_ENABLED:
+        return {'status': 'disabled'}
+    source, api_error = 'cache', None
+    try:
+        authed = GROK_AUTH_STORE.is_file() and 'sand-secrets' not in GROK_AUTH_STORE.name.lower()
+    except OSError:
+        authed = False
+    if 'sand-secrets' in GROK_AUTH_STORE.name.lower():
+        raise RuntimeError('refusing sand-secrets.json')
+    if time.monotonic() >= _GROK['next_due']:
+        if not authed:
+            api_error = 'unauthorized'
+            if not _GROK['reauth_logged']:
+                _GROK['reauth_logged'] = True
+                try:
+                    log(event='grok_auth_needed', reason='missing')
+                except Exception:
+                    pass
+                try:
+                    _grok_auth_status('unauthorized', reason='missing')
+                except Exception:
+                    pass
+        else:
+            _GROK['next_due'] = time.monotonic() + GROK_POLL_S
+            try:
+                _grok_write_cache(_grok_query_api())
+                source = 'api'
+                try:
+                    log(event='grok_api_ok', source='api')
+                except Exception:
+                    pass
+            except Exception as error:
+                api_error = (f'HTTP {error.code}' if isinstance(error, urllib.error.HTTPError)
+                             else str(error) if isinstance(error, PermissionError)
+                             else type(error).__name__)
+                try:
+                    log(event='grok_api_failed', reason=api_error)
+                except Exception:
+                    pass
+    try:
+        out = _grok_from_cache()
+    except TimeoutError:
+        raise
+    except Exception:
+        if not authed:
+            return {'status': 'unauthorized', 'reason': 'unauthorized'}
+        raise
+    out['source'] = source
+    if api_error:
+        out['api_error'] = api_error
+    return out
+
+
 def collect():
     out = {'checked_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds')}
     for name, fn in (('codex', fetch_codex), ('workbuddy', fetch_workbuddy),
-                     ('deepseek', fetch_deepseek)):
+                     ('deepseek', fetch_deepseek), ('grok', fetch_grok)):
         try:
             out[name] = fn()
         except Exception as error:
-            out[name] = {'status': 'unavailable', 'reason': type(error).__name__}
+            reason = type(error).__name__
+            if name == 'grok' and str(error) == 'reset_passed':
+                reason = str(error)
+            out[name] = {'status': 'unavailable', 'reason': reason}
     # Charging output: service-4 port values are PACKED voltage/current integers.
     # Reuses Codex's decode_ports + independent 5 s poll; a failed read never
     # becomes a fake 0 W. (Earlier "no wattage available" conclusion was wrong.)
@@ -384,6 +689,72 @@ def reset_short(window):
         return f"剩 {left_text} · {when.strftime('%H:%M')} 重置"
     except Exception:
         return '重置时间未知'
+
+
+WEEKDAY = '一二三四五六日'
+
+
+def reset_grok(stamp):
+    """「6天20时后 · 周五05:44」。后面由卡片再接「 重置」。"""
+    if not stamp:
+        return '重置时间未提供'
+    try:
+        when = datetime.datetime.fromtimestamp(float(stamp)).astimezone()
+        left = (when - datetime.datetime.now().astimezone()).total_seconds()
+        if left < 0:
+            return '即将重置'
+        days, rest = divmod(int(left) // 60, 1440)
+        hours, minutes = divmod(rest, 60)
+        if days:
+            left_text = f"{days}天{hours}时"
+        elif hours:
+            left_text = f"{hours}时{minutes}分"
+        else:
+            left_text = f"{minutes}分"
+        return f"{left_text}后 · 周{WEEKDAY[when.weekday()]}{when.strftime('%H:%M')}"
+    except Exception:
+        return '重置时间未知'
+
+
+def _age_hint(age):
+    age = max(0, int(age))
+    hours = age // 3600
+    if hours >= 24:
+        return f"{hours // 24}天前更新"
+    if hours:
+        return f"{hours}时前更新"
+    return f"{max(1, age // 60)}分前更新"
+
+
+def grok_lines(grok):
+    """Grok 卡上的三行字。没有可信读数时数字是「—」，不会变成 0%。"""
+    grok = grok or {}
+    remaining = grok.get('remaining')
+    ok = (grok.get('status') == 'live' and isinstance(remaining, (int, float))
+          and not isinstance(remaining, bool) and 0 <= float(remaining) <= 100)
+    age = int(grok.get('age_s') or 0)
+    if ok and age > GROK_HINT_AGE_S:
+        caption = _age_hint(age)
+        caption_small = True
+    elif grok.get('status') == 'unauthorized':
+        caption = '未授权'
+        caption_small = False
+    else:
+        caption = '本周剩余'
+        caption_small = False
+    if ok:
+        number = f"{float(remaining):.0f}%"
+        footer = reset_grok(grok.get('resets_at')) + ' 重置'
+    else:
+        number = '—'
+        if grok.get('status') == 'unauthorized':
+            footer = '请先完成授权'
+        elif grok.get('reason') == 'reset_passed':
+            footer = '已过重置时间 · 待刷新'
+        else:
+            footer = '额度数据暂不可用'
+    return {'caption': caption, 'number': number, 'footer': footer,
+            'ok': ok, 'caption_small': caption_small}
 
 
 def text_width(draw, text, fnt):
@@ -467,21 +838,32 @@ def border_points(box, radius=6):
     return pts
 
 
-# 账户模式的四个板块，按阅读顺序排；相位按序号等分，正好一拍一个。
-RELAY_BOXES = (
+# 关掉 Grok 时维持 11-10 定稿的四卡。打开后 Codex 缩到左上，Grok 放左下。
+RELAY_BOXES_ACCOUNT = (
     (8, 42, 311, 85),       # 充电：顶部
     (8, 91, 162, 219),      # Codex：左侧大块
     (168, 91, 311, 170),    # WorkBuddy：右上
     (168, 176, 311, 219),   # DeepSeek：右下
 )
+RELAY_BOXES_WITH_GROK = (
+    (8, 42, 311, 85),       # 充电：顶部
+    (8, 91, 162, 153),      # Codex：左上，缩小
+    (168, 91, 311, 153),    # WorkBuddy：右上，略矮
+    (168, 158, 311, 219),   # DeepSeek：右下
+    (8, 158, 162, 219),     # Grok：左下
+)
+
+
+def relay_boxes():
+    return RELAY_BOXES_WITH_GROK if GROK_ENABLED else RELAY_BOXES_ACCOUNT
 
 
 def synchronized_marquees(draw, boxes, phase, radius=6,
                           head=(255, 255, 255), tail=(178, 190, 204)):
-    """四块同时跑，相位严格等分，逐像素 smoothstep 渐变。
+    """每张卡一条光带，相位按卡片数量等分，逐像素 smoothstep 渐变。
 
     光带画在卡片外圈 1px：外面是黑底，纯白才亮得起来；画在边框上会像掉漆。
-    每块相差 1/4 圈，所以每一拍正好轮到下一块经过起点，首尾自然接上。
+    每块相差 1/N 圈，所以每一拍正好轮到下一块经过起点，首尾自然接上。
     """
     for beat, (x0, y0, x1, y1) in enumerate(boxes):
         path = border_points((x0 - 1, y0 - 1, x1 + 1, y1 + 1), radius + 1)
@@ -543,60 +925,107 @@ def render(data, pulse=False, phase=0.0):
         draw.text((17, 59), '未充电' if live else '数据暂不可用',
                   font=font(17), fill=INK if live else INK_SOFT)
 
-    # 左侧整块给 Codex：它有三行内容（5 小时、本周、重置时间），需要高度。
-    # 标题和两个窗口标签都放大过，太小的字在实物 LCD 上看不清。
-    shaded_box(im, draw, (8, 91, 162, 219), GRAD_CODEX, BORDER_CODEX, radius=6)
     cream = (255, 240, 236)
-    draw.text((17, 107), 'CODEX', font=numfont(16), fill=cream)
     codex = data.get('codex', {})
     windows = codex.get('windows', []) if codex.get('status') == 'live' else []
     short = next((w for w in windows if w.get('minutes') and w['minutes'] <= 1440), None)
     long = next((w for w in windows if w.get('minutes') and w['minutes'] > 1440), None)
-    right_align(draw, 152, 99, '剩余', font(10), cream)
-    for label, window, cy in (('5小时', short, 136), ('本周', long, 175)):
-        draw.text((17, cy), label, font=font(13), fill=cream, anchor='lm')
-        draw.text((152, cy),
-                  f"{window['remaining']:.0f}%" if window else '—',
-                  font=numfont(28), fill=cream if window else BAD, anchor='rm')
-    reset = reset_short(short) if short else '重置时间未知'
-    draw.text((17, 197), reset, font=font(11), fill=cream)
+    if GROK_ENABLED:
+        # 左上 Codex 缩小：5 小时和本周并排，下面一行重置。
+        shaded_box(im, draw, (8, 91, 162, 153), GRAD_CODEX, BORDER_CODEX, radius=6)
+        draw.text((16, 103), 'CODEX', font=numfont(13), fill=cream, anchor='ls')
+        right_align(draw, 154, 93, '剩余', font(9), cream)
+        for label, window, x0, x1 in (('5小时', short, 16, 82), ('本周', long, 90, 154)):
+            draw.text((x0, 122), label, font=font(10), fill=cream, anchor='lm')
+            draw.text((x1, 122), f"{window['remaining']:.0f}%" if window else '—',
+                      font=numfont(21), fill=cream if window else BAD, anchor='rm')
+        reset = reset_short(short) if short else '重置时间未知'
+        draw.text((16, 143), reset, font=font(10), fill=cream, anchor='lm')
+        _draw_grok_card(im, draw, data)
+        _draw_workbuddy(im, draw, data, box=(168, 91, 311, 153), rows=(117, 139), num_size=18)
+        _draw_deepseek(im, draw, data, box=(168, 158, 311, 219), large=True)
+    else:
+        # 左侧整块给 Codex：它有三行内容（5 小时、本周、重置时间），需要高度。
+        # 标题和两个窗口标签都放大过，太小的字在实物 LCD 上看不清。
+        shaded_box(im, draw, (8, 91, 162, 219), GRAD_CODEX, BORDER_CODEX, radius=6)
+        draw.text((17, 107), 'CODEX', font=numfont(16), fill=cream)
+        right_align(draw, 152, 99, '剩余', font(10), cream)
+        for label, window, cy in (('5小时', short, 136), ('本周', long, 175)):
+            draw.text((17, cy), label, font=font(13), fill=cream, anchor='lm')
+            draw.text((152, cy),
+                      f"{window['remaining']:.0f}%" if window else '—',
+                      font=numfont(28), fill=cream if window else BAD, anchor='rm')
+        reset = reset_short(short) if short else '重置时间未知'
+        draw.text((17, 197), reset, font=font(11), fill=cream)
+        _draw_workbuddy(im, draw, data, box=(168, 91, 311, 170), rows=(121, 150), num_size=19)
+        _draw_deepseek(im, draw, data, box=(168, 176, 311, 219), large=False)
 
-    # 右上 WorkBuddy：只有两个数字，不需要大块。
-    shaded_box(im, draw, (168, 91, 311, 170), GRAD_WB, BORDER_WB, radius=6)
+    # 底边 240，9 号中文字形实际高度约 13px，再往下会吃掉下半截。
+    # 颜色必须够亮：调色板会把淡灰压成杂色，看起来像被切了一半。
+    draw.text((9, 221), '余额更新 ' + stamp, font=font(11), fill=WHITE)
+    right_align(draw, 311, 221, '额度与账户余额', font(11), WHITE)
+
+    # 每张卡一条光带，按阅读顺序等分相位。
+    synchronized_marquees(draw, relay_boxes(), phase, radius=6)
+    return im
+
+
+def _draw_workbuddy(im, draw, data, box, rows, num_size):
+    """两个账号左右对齐。名称只在接口没给时才用「账号A / 账号B」占位。"""
+    shaded_box(im, draw, box, GRAD_WB, BORDER_WB, radius=6)
     title = 'WORKBUDDY'
-    draw.text((177, 104), title, font=numfont(10), fill=INK, anchor='ls')
+    title_y = box[1] + 13
+    draw.text((177, title_y), title, font=numfont(10), fill=INK, anchor='ls')
     # 和上面那串字母同一条基线，中文才不会看起来往下掉。
-    draw.text((177 + text_width(draw, title, numfont(10)) + 6, 104),
+    draw.text((177 + text_width(draw, title, numfont(10)) + 6, title_y),
               '积分', font=font(9), fill=INK, anchor='ls')
     wb = data.get('workbuddy', {})
     accounts = wb.get('accounts', []) if wb.get('status') == 'live' else []
-    for index, (fallback, cy) in enumerate((('账号A', 121), ('账号B', 150))):
+    for index, (fallback, cy) in enumerate(zip(('账号A', '账号B'), rows)):
         account = accounts[index] if index < len(accounts) else None
         name = str((account or {}).get('name', fallback))
         value = f"{account['balance']:,.0f}" if account else '—'
-        # 名称左中、数字右中，共用一个中心线，两者自动对齐。
         draw.text((177, cy), name, font=font(11), fill=INK, anchor='lm')
-        size = 19
+        size = num_size
         while size > 11 and text_width(draw, value, numfont(size)) > 96:
             size -= 1
         draw.text((303, cy), value, font=numfont(size),
                   fill=INK if account else BAD, anchor='rm')
 
-    shaded_box(im, draw, (168, 176, 311, 219), GRAD_DS, BORDER_DS, radius=6)
-    draw.text((177, 180), 'DEEPSEEK', font=numfont(10), fill=INK)
+
+def _draw_deepseek(im, draw, data, box, large):
+    shaded_box(im, draw, box, GRAD_DS, BORDER_DS, radius=6)
     ds = data.get('deepseek', {})
     ds_ok = ds.get('status') == 'live'
-    draw.text((176, 191), f"¥{ds['cny']:.2f}" if ds_ok else '—',
-              font=numfont(26), fill=INK if ds_ok else BAD)
+    value = f"¥{ds['cny']:.2f}" if ds_ok else '—'
+    if large:
+        draw.text((177, box[1] + 12), 'DEEPSEEK', font=numfont(10), fill=INK, anchor='ls')
+        size = 28
+        while size > 14 and text_width(draw, value, numfont(size)) > 126:
+            size -= 1
+        draw.text((177, box[1] + 38), value, font=numfont(size),
+                  fill=INK if ds_ok else BAD, anchor='lm')
+    else:
+        draw.text((177, 180), 'DEEPSEEK', font=numfont(10), fill=INK)
+        draw.text((176, 191), value, font=numfont(26), fill=INK if ds_ok else BAD)
 
-    # 底边 240，9 号中文字形实际高度约 13px，再往下会吃掉下半截。
-    # 颜色必须够亮：64 色调色板会把淡灰压成杂色，看起来像被切了一半。
-    draw.text((9, 221), '余额更新 ' + stamp, font=font(11), fill=WHITE)
-    right_align(draw, 311, 221, '额度与账户余额', font(11), WHITE)
 
-    # 四条光带同一节拍运动，按阅读顺序等分相位。
-    synchronized_marquees(draw, RELAY_BOXES, phase, radius=6)
-    return im
+def _draw_grok_card(im, draw, data):
+    """左下石墨卡：大号白字剩余百分比，琥珀色重置倒计时。没有读数就画「—」。"""
+    shaded_box(im, draw, (8, 158, 162, 219), GRAD_GROK, BORDER_GROK, radius=6)
+    lines = grok_lines(data.get('grok'))
+    draw.text((16, 172), 'GROK', font=numfont(15), fill=WHITE, anchor='ls')
+    draw.text((16, 186), lines['caption'],
+              font=font(10 if lines['caption_small'] else 11),
+              fill=DIM if lines['ok'] else BAD, anchor='lm')
+    draw.text((154, 181), lines['number'], font=numfont(34),
+              fill=WHITE if lines['ok'] else BAD, anchor='rm')
+    footer = lines['footer']
+    size = 12
+    while size > 8 and text_width(draw, footer, font(size)) > 140:
+        size -= 1
+    draw.text((16, 209), footer, font=font(size),
+              fill=AMBER if lines['ok'] else BAD, anchor='lm')
 
 
 def render_expired():
@@ -611,29 +1040,46 @@ def render_expired():
 
 
 _PHASE = 0.0
-PHASE_STEP = 0.05   # 一圈 20 秒；四块错开 1/4，正好每 5 秒一拍
+PHASE_STEP = 0.05   # 一圈 20 秒；相位按卡片数等分
 MOTION_FRAMES = 6   # 一秒切成 6 个子帧，运动才不会一跳一格
+_PALETTE_AT = 0     # 上次放进 24572 的那一档；下次先试比它多一档的
+
+
+def _save_gif(motion, expired, colors, tmp):
+    palette = motion[0].quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+    frames = [palette]
+    frames.extend(frame.quantize(palette=palette, dither=Image.Dither.NONE)
+                  for frame in motion[1:])
+    frames.append(expired.quantize(palette=palette, dither=Image.Dither.NONE))
+    frames[0].save(tmp, format='GIF', save_all=True,
+                   append_images=frames[1:],
+                   duration=[170, 170, 170, 170, 160, 160, 419000, 60000],
+                   optimize=True)
+    return tmp.stat().st_size
 
 
 def publish(data):
-    global _PHASE
+    global _PHASE, _PALETTE_AT
     phases = [_PHASE + PHASE_STEP * index / MOTION_FRAMES
               for index in range(MOTION_FRAMES + 1)]
     motion = [render(data, phase=phase) for phase in phases]
     _PHASE = (_PHASE + PHASE_STEP) % 1.0
     expired = render_expired()
-    # 64 色 Median Cut：渐变还能看，同时给边框运动的增量帧留出体积余量。
-    # （96/80 色配 2px 光带都会超过 24572 字节上限，实测过。）
-    palette = motion[0].quantize(colors=56, method=Image.Quantize.MEDIANCUT)
-    frames = [palette]
-    frames.extend(frame.quantize(palette=palette, dither=Image.Dither.NONE)
-                  for frame in motion[1:])
-    frames.append(expired.quantize(palette=palette, dither=Image.Dither.NONE))
+    # 五张卡时 56 色可能到 26 KB 以上，/live.bin 会把超限帧直接丢掉。
+    # 按 56、44、36、28 往下降，直到放进 24572。下次从上次档位往上试一档，
+    # 画面变简单时还能回到 56 色，不必每秒把四档都压一遍。
     tmp = GIF.with_suffix('.gif.tmp')
-    frames[0].save(tmp, format='GIF', save_all=True,
-                   append_images=frames[1:],
-                   duration=[170, 170, 170, 170, 160, 160, 419000, 60000],
-                   optimize=True)
+    first = max(0, _PALETTE_AT - 1)
+    colors = PALETTE_STEPS[-1]
+    for index, colors in enumerate(PALETTE_STEPS[first:], first):
+        size = _save_gif(motion, expired, colors, tmp)
+        if size <= STREAM_GIF_MAX:
+            _PALETTE_AT = index
+            break
+    else:
+        _PALETTE_AT = len(PALETTE_STEPS) - 1
+        log(event='gif_over_budget', bytes=tmp.stat().st_size, colors=colors)
+    data['gif_colors'] = colors
     validate_gif(tmp)
     tmp.replace(GIF)
     # Preview from the DECODED gif, so it shows the real transmitted colours.
@@ -647,8 +1093,9 @@ def publish(data):
 def refresh():
     data = collect()
     size = publish(data)
-    log(statuses={k: data.get(k, {}).get('status') for k in ('codex', 'workbuddy', 'deepseek')},
-        gif_bytes=size)
+    log(statuses={k: data.get(k, {}).get('status')
+                 for k in ('codex', 'workbuddy', 'deepseek', 'grok')},
+        gif_bytes=size, gif_colors=data.get('gif_colors'))
     return data
 
 
@@ -699,7 +1146,8 @@ def main():
     if args.once:
         data = refresh()
         print(json.dumps({k: data.get(k, {}).get('status')
-                          for k in ('codex', 'workbuddy', 'deepseek')}, ensure_ascii=False))
+                          for k in ('codex', 'workbuddy', 'deepseek', 'grok')},
+                         ensure_ascii=False))
         print('gif_bytes', GIF.stat().st_size)
         return
     bootstrap()
@@ -717,7 +1165,7 @@ def main():
         # 每秒重画一次是给边框动画用的；余额仍 60 秒、功率仍 5 秒刷新。
         #
         # 关键：余额刷新放到后台线程做。collect() 要依次请求 Codex、WorkBuddy、
-        # DeepSeek 三个源，网络慢的时候会卡十几秒；以前它跑在主循环里，
+        # DeepSeek，打开 Grok 卡时再加上那一路，网络慢的时候会卡十几秒；以前它跑在主循环里，
         # 这段时间既不重绘也不复制充电样本，表现就是「功率数字半天不动」。
         # 放到后台后主循环始终每秒走一圈，充电读数不再被账户请求拖住。
         while True:
@@ -728,11 +1176,11 @@ def main():
                     updated = balance_future.result()
                     # 只回写账户字段。整份 data 覆盖会把主循环刚更新的充电样本
                     # 换成后台线程启动时的旧值，等于白回退 60 秒。
-                    for name in ('codex', 'workbuddy', 'deepseek'):
+                    for name in ('codex', 'workbuddy', 'deepseek', 'grok'):
                         data[name] = updated[name]
                     data['checked_at'] = updated['checked_at']
                     log(statuses={name: data[name].get('status') for name in
-                                  ('codex', 'workbuddy', 'deepseek')})
+                                  ('codex', 'workbuddy', 'deepseek', 'grok')})
                 except Exception as error:
                     log(event='balance_refresh_failed', reason=type(error).__name__)
                 balance_future = None
