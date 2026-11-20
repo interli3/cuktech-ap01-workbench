@@ -12,3 +12,13 @@ probe.gif
 probe.png
 preview.png
 *.jsonl
+
+# Cursor / Grok 独立登录的密文、用量缓存、一次性登录链接。
+# 默认已经落在 run/ 里；这里再按文件名挡一层，避免改了 state_dir 之后被提交。
+grok_cursor_auth.bin
+grok_cursor_auth.bin.tmp
+grok_usage.json
+grok_usage.json.tmp
+grok_auth_status.json
+grok_auth_status.json.tmp
+grok_auth_link.txt

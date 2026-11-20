@@ -95,5 +95,5 @@ RAM 加载器方案（固件槽 221,445 字节 / 加载器 256 KiB），
 
 ## 七、免责声明
 
-本项目与酷态科（CUKTECH）、小米、OpenAI、DeepSeek、WorkBuddy 均无隶属关系。
+本项目与酷态科（CUKTECH）、小米、OpenAI、DeepSeek、WorkBuddy、Cursor 均无隶属关系。
 刷机可能变砖、失去保修、触发账号风控。所有操作由使用者自行承担风险。

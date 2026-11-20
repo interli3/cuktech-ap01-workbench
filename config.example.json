@@ -40,7 +40,17 @@
     "workbuddy_snapshot": "http://127.0.0.1:8791/snapshot",
     "deepseek_endpoint": "https://api.deepseek.com/user/balance",
     "deepseek_key_store": "run/deepseek_key.bin",
-    "codex_bin_root": "%LOCALAPPDATA%/OpenAI/Codex/bin"
+    "codex_bin_root": "%LOCALAPPDATA%/OpenAI/Codex/bin",
+    "grok_enabled": true,
+    "grok_cache": "run/grok_usage.json",
+    "grok_auth_store": "run/grok_cursor_auth.bin",
+    "grok_auth_status": "run/grok_auth_status.json",
+    "grok_link_file": "run/grok_auth_link.txt",
+    "grok_usage_url": "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus",
+    "grok_refresh_url": "https://api2.cursor.sh/auth/exchange_user_api_key",
+    "grok_login_url": "https://cursor.com/loginDeepControl",
+    "grok_poll_url": "https://api2.cursor.sh/auth/poll",
+    "grok_dashboard_url": "https://api2.cursor.sh/aiserver.v1.DashboardService/"
   },
   "allowed_dids": {
     "1234567890": "示例 DID，请换成你自己的",
